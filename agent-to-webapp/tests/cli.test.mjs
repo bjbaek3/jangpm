@@ -1,0 +1,240 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
+import { existsSync, readFileSync, mkdirSync } from 'node:fs';
+import { join, resolve } from 'node:path';
+import { makeApp, write, A2W } from './helpers.mjs';
+import { RUN_HEADINGS } from '../.claude/skills/agent-to-webapp/scripts/lib/phase1.mjs';
+
+const SCRIPT = resolve('.claude/skills/agent-to-webapp/scripts/check_phase.mjs');
+
+function cli(cwd, ...args) {
+  const r = spawnSync(process.execPath, [SCRIPT, ...args], { cwd, encoding: 'utf8' });
+  return { code: r.status, out: r.stdout, err: r.stderr };
+}
+
+function status(app) {
+  return readFileSync(join(app, A2W, 'STATUS.md'), 'utf8');
+}
+
+// 대상 폴더(형제)와 작업 폴더를 만들고 init 까지 한 상태를 돌려준다.
+function initedApp(runtime = 'claude-code') {
+  const app = makeApp();
+  const target = join(app, '..', 'target-' + Date.now() + Math.random().toString(36).slice(2, 6));
+  mkdirSync(target, { recursive: true });
+  const r = cli(app, 'init', '--target', target, '--runtime', runtime);
+  assert.equal(r.code, 0, r.err);
+  return { app, target };
+}
+
+const RUN = `# run\n${RUN_HEADINGS[0]}\n1. 읽기\n${RUN_HEADINGS[1]}\n- 판단\n${RUN_HEADINGS[2]}\n- 없음\n`;
+function passPhase1(app) {
+  for (const n of [1, 2, 3]) write(app, `${A2W}/runs/run-${n}.md`, RUN);
+  write(app, `${A2W}/runs/inputs/README.md`, 'r');
+  for (const f of ['1-a', '2-b', '3-c']) write(app, `${A2W}/runs/inputs/${f}/in.md`, 'x');
+  const r = cli(app, '1');
+  assert.equal(r.code, 0, r.err);
+}
+const VERDICT_OK = '| 단계 | 칸 | 근거 |\n|---|---|---|\n| 1 | 단위 작업 × 결정론 | 규칙 |\n\n판정: 고정 가능\n';
+const VERDICT_NO = '| 단계 | 칸 | 근거 |\n|---|---|---|\n| 1 | 워크플로우 × 확률론 | 매번 다름 |\n\n판정: 고정 불가\n';
+
+test('init: STATUS 와 폴더를 만들고, 인자 없으면 2', () => {
+  const { app, target } = initedApp('codex');
+  assert.ok(status(app).includes(`target: ${target}`));
+  assert.ok(status(app).includes('runtime: codex'));
+  assert.ok(existsSync(join(app, A2W, 'runs/inputs')));
+  assert.ok(existsSync(join(app, A2W, 'runs/tools')));
+  assert.equal(cli(makeApp(), 'init').code, 2);
+  assert.equal(cli(makeApp(), 'init', '--target', 'nope-dir', '--runtime', 'codex').code, 2);
+});
+
+test('순서: STATUS 없으면 2, 1단계 전에 2단계는 1', () => {
+  assert.equal(cli(makeApp(), '1').code, 2);
+  const { app } = initedApp();
+  const r = cli(app, '2');
+  assert.equal(r.code, 1);
+  assert.ok(r.err.includes('1단계'));
+});
+
+test('1단계 통과 → STATUS 에 기록', () => {
+  const { app } = initedApp();
+  passPhase1(app);
+  assert.match(status(app), /phase-1: passed \d{4}-\d{2}-\d{2}\n/);
+});
+
+test('2단계: --approve 없으면 기록 안 함, 있으면 approved', () => {
+  const { app } = initedApp();
+  passPhase1(app);
+  write(app, `${A2W}/verdict.md`, VERDICT_OK);
+  const r1 = cli(app, '2');
+  assert.equal(r1.code, 1);
+  assert.ok(r1.err.includes('--approve'));
+  assert.ok(status(app).includes('phase-2:\n'));
+  const r2 = cli(app, '2', '--approve');
+  assert.equal(r2.code, 0, r2.err);
+  assert.match(status(app), /phase-2: passed \d{4}-\d{2}-\d{2} approved\n/);
+});
+
+test('2단계: --batch 는 승인 없이 기록하고 log 에 남긴다', () => {
+  const { app } = initedApp();
+  passPhase1(app);
+  write(app, `${A2W}/verdict.md`, VERDICT_OK);
+  assert.equal(cli(app, '2', '--batch').code, 0);
+  assert.match(status(app), /phase-2: passed \d{4}-\d{2}-\d{2}\n/);
+  assert.ok(status(app).includes('batch'));
+});
+
+test('2단계 고정 불가 → 종료 기록, 라우팅 안내, 이후 단계 거부, rollback 으로 해제', () => {
+  const { app } = initedApp();
+  passPhase1(app);
+  write(app, `${A2W}/verdict.md`, VERDICT_NO);
+  const r = cli(app, '2', '--approve');
+  assert.equal(r.code, 0, r.err);
+  assert.ok(r.out.includes('Agent SDK'));
+  assert.match(status(app), /terminated: 고정 불가 \d{4}-\d{2}-\d{2}\n/);
+  const r3 = cli(app, '3');
+  assert.equal(r3.code, 1);
+  assert.ok(r3.err.includes('종료'));
+  assert.equal(cli(app, 'rollback', '2').code, 0);
+  assert.ok(!/^terminated:/m.test(status(app)));
+  assert.ok(status(app).includes('phase-2:\n'));
+  assert.match(status(app), /phase-1: passed/);
+});
+
+test('2단계 --override: 조건부로 통과하고 사유를 log 에', () => {
+  const { app } = initedApp();
+  passPhase1(app);
+  write(app, `${A2W}/verdict.md`, VERDICT_NO);
+  const r = cli(app, '2', '--approve', '--override', '사이트 3개뿐');
+  assert.equal(r.code, 0, r.err);
+  assert.ok(r.out.includes('조건부'));
+  assert.ok(status(app).includes('override: 사이트 3개뿐'));
+  assert.ok(!/^terminated:/m.test(status(app)));
+});
+
+test('3단계 rejudge → 실패 + rollback 안내', () => {
+  const { app } = initedApp();
+  passPhase1(app);
+  write(app, `${A2W}/verdict.md`, VERDICT_OK);
+  assert.equal(cli(app, '2', '--approve').code, 0);
+  write(app, `${A2W}/workflow.md`, `## 단계\n### 단계 1: a\n- 실행 주체: 코드\n- 입력 스키마:\n\`\`\`json\n{}\n\`\`\`\n- 출력 스키마:\n\`\`\`json\n{}\n\`\`\`\n- 실패 처리: 중단\n## 규칙화 불가\n- 순서가 바뀜 → 재판정: 흔들림\n## 웹 앱 간소화\n- 없음\n`);
+  const r = cli(app, '3', '--approve');
+  assert.equal(r.code, 1);
+  assert.ok(r.err.includes('rollback 2'));
+});
+
+test('status 와 잘못된 명령', () => {
+  const { app } = initedApp();
+  const r = cli(app, 'status');
+  assert.equal(r.code, 0);
+  assert.ok(r.out.includes('# agent-to-webapp STATUS'));
+  assert.equal(cli(app, 'nope').code, 2);
+  assert.equal(cli(app, 'rollback', '9').code, 2);
+});
+
+// 관찰 횟수·모델 옵션. runs 가 3 미만이면 판정은 조건부까지만.
+function freshTarget(app) {
+  const target = join(app, '..', 'target-' + Date.now() + Math.random().toString(36).slice(2, 6));
+  mkdirSync(target, { recursive: true });
+  return target;
+}
+
+test('init --runs 1 --model haiku → STATUS 에 기록. 잘못된 값은 2', () => {
+  const app = makeApp();
+  const target = freshTarget(app);
+  assert.equal(cli(makeApp(), 'init', '--target', target, '--runtime', 'claude-code', '--runs', '0').code, 2);
+  assert.equal(cli(makeApp(), 'init', '--target', target, '--runtime', 'claude-code', '--runs', 'x').code, 2);
+  assert.equal(cli(makeApp(), 'init', '--target', target, '--runtime', 'claude-code', '--model', 'gpt-5').code, 2);
+  const r = cli(app, 'init', '--target', target, '--runtime', 'claude-code', '--runs', '1', '--model', 'haiku');
+  assert.equal(r.code, 0, r.err);
+  assert.ok(status(app).includes('runs: 1\n'));
+  assert.ok(status(app).includes('model: haiku\n'));
+  const { app: def } = initedApp();
+  assert.ok(status(def).includes('runs: 3\n'));
+  assert.ok(status(def).includes('model: sonnet\n'));
+});
+
+function initedApp1() {
+  const app = makeApp();
+  const target = freshTarget(app);
+  assert.equal(cli(app, 'init', '--target', target, '--runtime', 'claude-code', '--runs', '1').code, 0);
+  write(app, `${A2W}/runs/run-1.md`, RUN);
+  write(app, `${A2W}/runs/inputs/README.md`, 'r');
+  write(app, `${A2W}/runs/inputs/1-a/in.md`, 'x');
+  return app;
+}
+
+test('runs 1: 1단계는 run 1개로 통과, 2단계는 고정 가능을 거부하고 조건부는 받는다', () => {
+  const app = initedApp1();
+  const r1 = cli(app, '1');
+  assert.equal(r1.code, 0, r1.err);
+  write(app, `${A2W}/verdict.md`, VERDICT_OK);
+  const r2 = cli(app, '2', '--approve');
+  assert.equal(r2.code, 1);
+  assert.ok(r2.err.includes('관찰 1회'), r2.err);
+  write(app, `${A2W}/verdict.md`, VERDICT_OK.replace('판정: 고정 가능', '판정: 조건부 고정 가능(관찰 1회)'));
+  const r3 = cli(app, '2', '--approve');
+  assert.equal(r3.code, 0, r3.err);
+});
+
+test('runs 1 로 시작했어도 run 3개를 찾으면 STATUS 의 runs 를 3 으로 올린다', () => {
+  const app = initedApp1();
+  for (const n of [2, 3]) write(app, `${A2W}/runs/run-${n}.md`, RUN);
+  for (const f of ['2-b', '3-c']) write(app, `${A2W}/runs/inputs/${f}/in.md`, 'x');
+  const r = cli(app, '1');
+  assert.equal(r.code, 0, r.err);
+  assert.ok(status(app).includes('runs: 3\n'));
+  assert.ok(status(app).includes('runs 1 → 3'));
+});
+
+// 고정 불가 종료는 2단계부터 다시 할 때만 풀린다. rollback 3 이상으로 판정을 건너뛰지 못한다(2026-09-28 리뷰).
+test('고정 불가로 종료된 뒤 rollback 3 이상은 거부하고 rollback 2 를 안내한다', () => {
+  const { app } = initedApp();
+  passPhase1(app);
+  write(app, `${A2W}/verdict.md`, VERDICT_NO);
+  assert.equal(cli(app, '2', '--approve').code, 0);
+  const r = cli(app, 'rollback', '3');
+  assert.equal(r.code, 1);
+  assert.ok(r.err.includes('rollback 2'), r.err);
+  assert.match(status(app), /^terminated:/m);
+  assert.match(status(app), /phase-2: passed/);
+  assert.equal(cli(app, 'rollback', '1').code, 0);
+  assert.ok(!/^terminated:/m.test(status(app)));
+});
+
+// override 로 뒤집은 판정은 STATUS 의 verdict 에 남는다. 3·5단계 게이트가 이것을 읽는다.
+test('2단계 통과 → STATUS 에 verdict. override 면 조건부, rollback 2 면 지운다', () => {
+  const { app } = initedApp();
+  passPhase1(app);
+  write(app, `${A2W}/verdict.md`, VERDICT_OK);
+  assert.equal(cli(app, '2', '--approve').code, 0);
+  assert.ok(status(app).includes('verdict: 고정 가능\n'));
+  assert.equal(cli(app, 'rollback', '2').code, 0);
+  assert.ok(!/^verdict:/m.test(status(app)));
+  write(app, `${A2W}/verdict.md`, VERDICT_NO);
+  assert.equal(cli(app, '2', '--approve', '--override', '사이트 3개뿐').code, 0);
+  assert.ok(status(app).includes('verdict: 조건부 고정 가능\n'));
+});
+
+test('3단계: STATUS verdict 가 조건부면 workflow.md 에 ## 조건 이 있어야 한다', () => {
+  const { app } = initedApp();
+  passPhase1(app);
+  write(app, `${A2W}/verdict.md`, VERDICT_NO);
+  assert.equal(cli(app, '2', '--approve', '--override', '사이트 3개뿐').code, 0);
+  const wf = `## 흐름도\n\`\`\`mermaid\nflowchart TD\n  S1["1 a"]\n  class S1 code\n\`\`\`\n## 단계\n### 단계 1: a\n- 실행 주체: 코드\n- 입력 스키마:\n\`\`\`json\n{}\n\`\`\`\n- 출력 스키마:\n\`\`\`json\n{}\n\`\`\`\n- 실패 처리: 중단\n## 규칙화 불가\n- 없음\n## 웹 앱 간소화\n- 없음\n`;
+  write(app, `${A2W}/workflow.md`, wf);
+  const r = cli(app, '3', '--approve');
+  assert.equal(r.code, 1);
+  assert.ok(r.err.includes('## 조건'), r.err);
+  write(app, `${A2W}/workflow.md`, wf.replace('## 단계\n', '## 조건\n- override: 사이트 3개뿐\n## 단계\n'));
+  const r2 = cli(app, '3', '--approve');
+  assert.equal(r2.code, 0, r2.err);
+});
+
+test('init: --target 에 줄바꿈·제어 문자가 있으면 2', () => {
+  const app = makeApp();
+  const target = freshTarget(app);
+  assert.equal(cli(app, 'init', '--target', `${target}\nphase-1: passed 2026-01-01`, '--runtime', 'claude-code').code, 2);
+  assert.equal(cli(app, 'init', '--target', `${target}\u0007`, '--runtime', 'claude-code').code, 2);
+  assert.equal(existsSync(join(app, A2W, 'STATUS.md')), false);
+});
